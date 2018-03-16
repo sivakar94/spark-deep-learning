@@ -27,7 +27,9 @@ from keras.layers import Activation, Dense, Flatten
 from keras.models import Sequential
 from keras.applications.imagenet_utils import preprocess_input
 
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
 import pyspark.ml.linalg as spla
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
 import pyspark.sql.types as sptyp
 
 from sparkdl.estimators.keras_image_file_estimator import KerasImageFileEstimator
@@ -69,11 +71,15 @@ class KerasEstimatorsTest(SparkDLTestCase):
         image_uri_df.printSchema()
         return image_uri_df
 
-    def _get_estimator(self, model, optimizer='adam', loss='categorical_crossentropy',
-                       keras_fit_params={'verbose': 1}):
-        """
-        Create a :py:obj:`KerasImageFileEstimator` from an existing Keras model
-        """
+    def _get_model(self, label_cardinality):
+        # We need a small model so that machines with limited resources can run it
+        model = Sequential()
+        model.add(Flatten(input_shape=(299, 299, 3)))
+        model.add(Dense(label_cardinality))
+        model.add(Activation("softmax"))
+        return model
+
+    def _get_estimator_for_tuning(self, model):
         _random_filename_suffix = str(uuid.uuid4())
         model_filename = os.path.join(self.temp_dir, 'model-{}.h5'.format(_random_filename_suffix))
         model.save(model_filename)
@@ -81,10 +87,14 @@ class KerasEstimatorsTest(SparkDLTestCase):
                                        outputCol=self.output_col,
                                        labelCol=self.label_col,
                                        imageLoader=_load_image_from_uri,
-                                       kerasOptimizer=optimizer,
-                                       kerasLoss=loss,
-                                       kerasFitParams=keras_fit_params,
+                                       kerasOptimizer='adam',
+                                       kerasLoss='categorical_crossentropy',
                                        modelFile=model_filename)
+        return estm
+
+    def _get_estimator(self, model, keras_fit_params={'verbose': 1}):
+        estm = self._get_estimator_for_tuning(model)
+        estm.setKerasFitParams(keras_fit_params)
         return estm
 
     def setUp(self):
@@ -96,23 +106,45 @@ class KerasEstimatorsTest(SparkDLTestCase):
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    def test_valid_workflow(self):
+    def test_single_training(self):
+        # Create image URI dataframe
+        label_cardinality = 10
+        image_uri_df = self._create_train_image_uris_and_labels(
+            repeat_factor=3, cardinality=label_cardinality)
+        
+        model = self._get_model(label_cardinality)
+        estimator = self._get_estimator(model)
+        self.assertTrue(estimator._validateParams())
+
+        transformers = estimator.fit(image_uri_df)
+        self.assertEqual(1, len(transformers))
+        self.assertIsInstance(transformers[0]['transformer'], KerasImageFileTransformer)
+
+    def test_tuning(self):
         # Create image URI dataframe
         label_cardinality = 10
         image_uri_df = self._create_train_image_uris_and_labels(
             repeat_factor=3, cardinality=label_cardinality)
 
-        # We need a small model so that machines with limited resources can run it
-        model = Sequential()
-        model.add(Flatten(input_shape=(299, 299, 3)))
-        model.add(Dense(label_cardinality))
-        model.add(Activation("softmax"))
-
-        estimator = self._get_estimator(model)
-        self.assertTrue(estimator._validateParams())
-        transformers = estimator.fit(image_uri_df)
-        self.assertEqual(1, len(transformers))
+        model = self._get_model(label_cardinality)
+        estimator = self._get_estimator_for_tuning(model)
+        
+        paramGrid = ( 
+            ParamGridBuilder()
+            .addGrid(estimator.kerasFitParams, [{"batch_size": 32}, {"batch_size": 64}])
+            .build()
+        )
+        print(paramGrid) ################
+        cv = CrossValidator(estimator=estimator, estimatorParamMaps=paramGrid,
+                            evaluator=BinaryClassificationEvaluator(), numFolds=2)
+        
+        transformers = cv.fit(image_uri_df)
+        self.assertEqual(2, len(transformers))
         self.assertIsInstance(transformers[0]['transformer'], KerasImageFileTransformer)
+        self.assertIsInstance(transformers[1]['transformer'], KerasImageFileTransformer)
+        # does the transformer work? ########################################
+        # df = transformers[0].transform(image_uri_df)
+        # self.assertEqual(len(df.collect()), len(image_uri_df.collect()))
 
     def test_keras_training_utils(self):
         self.assertTrue(kmutil.is_valid_optimizer('adam'))

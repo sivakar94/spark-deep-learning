@@ -131,6 +131,7 @@ class KerasImageFileEstimator(Estimator, HasInputCol, HasInputImageNodeName,
         kwargs = self._input_kwargs
         return self._set(**kwargs)
 
+    # TODO: this may not work as expected with Spark 2.3 -- only one param setting might get passed in.
     def fit(self, dataset, params=None):
         """
         Fits a model to the input dataset with optional parameters.
@@ -257,6 +258,7 @@ class KerasImageFileEstimator(Estimator, HasInputCol, HasInputImageNodeName,
         :return: list of fitted models, matching the order of paramMaps
         """
         sc = JVMAPI._curr_sc()
+        print(paramMaps) ###############
         paramMapsRDD = sc.parallelize(paramMaps, numSlices=len(paramMaps))
 
         # Extract image URI from provided dataset and create features as numpy arrays
